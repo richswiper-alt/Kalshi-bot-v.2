@@ -7,6 +7,7 @@ process.on('uncaughtException', (err) => {
 
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api').default || require('node-telegram-bot-api');
+const { EventEmitter } = require('events');
 const axios = require('axios');
 const crypto = require('crypto');
 const fs = require('fs');
@@ -38,12 +39,18 @@ try {
   if (rawKey.charCodeAt(0) === 0xFEFF) rawKey = rawKey.slice(1);
   KALSHI_API_SECRET = rawKey.trim() + '\n';
 } catch (err) {
-  console.error(`❌ Could not read private key file at ${KALSHI_KEY_PATH}. Make sure kalshi_key.pem exists in this folder.`);
+  if (process.env.NODE_ENV !== 'test') {
+    console.warn(`⚠️ Private key unavailable at ${KALSHI_KEY_PATH}; Kalshi features are disabled.`);
+  }
 }
 
-if (!TELEGRAM_TOKEN || !KALSHI_API_KEY || !KALSHI_API_SECRET || !YOUR_TELEGRAM_ID) {
-  console.error('❌ Missing required environment variables. Check TELEGRAM_TOKEN, KALSHI_API_KEY, kalshi_key.pem file, YOUR_TELEGRAM_ID');
-  process.exit(1);
+const isPlaceholder = (value) => !value || /^REPLACE_WITH/i.test(value) || value === '-';
+const HAS_TELEGRAM_CREDENTIALS = !isPlaceholder(TELEGRAM_TOKEN) && !isPlaceholder(YOUR_TELEGRAM_ID);
+const HAS_KALSHI_CREDENTIALS = !isPlaceholder(KALSHI_API_KEY) && Boolean(KALSHI_API_SECRET);
+const NO_CREDENTIALS_MODE = !HAS_TELEGRAM_CREDENTIALS || !HAS_KALSHI_CREDENTIALS;
+
+if (NO_CREDENTIALS_MODE) {
+  console.warn('ℹ️ Running in no-credentials mode: public data and local state only; trading and Telegram are disabled.');
 }
 
 // ============================================
@@ -580,7 +587,18 @@ function loadState() {
 // ============================================
 // TELEGRAM BOT
 // ============================================
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+const bot = HAS_TELEGRAM_CREDENTIALS
+  ? new TelegramBot(TELEGRAM_TOKEN, { polling: true })
+  : (() => {
+      const offlineBot = new EventEmitter();
+      offlineBot.onText = () => offlineBot;
+      offlineBot.sendMessage = async () => ({ offline: true });
+      offlineBot.sendPhoto = async () => ({ offline: true });
+      offlineBot.answerCallbackQuery = async () => ({ offline: true });
+      offlineBot.editMessageReplyMarkup = async () => ({ offline: true });
+      offlineBot.deleteMessage = async () => ({ offline: true });
+      return offlineBot;
+    })();
 
 function notify(message, opts = {}) {
   // Public channel filtering: keep best sauce (quant/auto-hit) private
@@ -1948,6 +1966,8 @@ const kalshiMarketCache = new Map();
 const CACHE_TTL = 10000; // 10 seconds
 
 async function kalshiRequest(method, path, body = null) {
+  if (NO_CREDENTIALS_MODE || !HAS_KALSHI_CREDENTIALS) return null;
+
   // Auto-reset circuit breaker after cooldown
   if (kalshiRateLimiter.circuitOpen && Date.now() - kalshiRateLimiter.circuitOpenTime >= kalshiRateLimiter.circuitResetMs) {
     kalshiRateLimiter.circuitOpen = false;
@@ -6971,8 +6991,10 @@ console.log('Strategy: FAVORITE + UNDERDOG dual-play · SMA/RSI/BB trend · memo
   console.log('💓 Health monitor active — heartbeat every 60s, alerts on issues');
 
 loadState();
-botState.isRunning = true;  // Auto-start on boot
-console.log('✅ Bot initialized. Auto-started scanning.');
+botState.isRunning = !NO_CREDENTIALS_MODE;  // Live scanning requires complete credentials
+console.log(NO_CREDENTIALS_MODE
+  ? '✅ Bot initialized in offline mode. Add real Telegram and Kalshi credentials to enable live scanning and trading.'
+  : '✅ Bot initialized. Auto-started scanning.');
 if (KALSHI_API_SECRET) {
   const firstLine = KALSHI_API_SECRET.split('\n')[0];
   const looksValid = firstLine.includes('BEGIN') && firstLine.includes('PRIVATE KEY');
@@ -6982,6 +7004,7 @@ startMonitoring();
 
 // Fetch live Kalshi balance on startup
 (async () => {
+  if (NO_CREDENTIALS_MODE) return;
   try {
     const bal = await getKalshiBalance();
     if (bal != null && isFinite(bal)) {
