@@ -34,3 +34,4 @@ npm start
 - `index.js` - Main bot engine
 - `.env` - Configuration (create from template)
 - `package.json` - Dependencies
+DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...' >> ~/.env
