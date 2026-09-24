@@ -124,6 +124,86 @@ function analyze(rows) {
   };
 }
 
+function normalizeKalshiMarket(raw) {
+  const yes = Number(raw?.yes_ask_dollars ?? raw?.yes_bid_dollars ?? 0);
+  const no = Number(raw?.no_ask_dollars ?? raw?.no_bid_dollars ?? 0);
+  const floorStrike = Number(raw?.floor_strike ?? 0);
+  const topProb = Math.max(yes, no);
+  const side = yes >= no ? 'YES' : 'NO';
+  return {
+    ticker: raw?.ticker ?? '',
+    title: raw?.title || raw?.name || '',
+    eventTicker: raw?.event_ticker ?? '',
+    closeTime: raw?.close_time ?? '',
+    status: raw?.status ?? '',
+    yes,
+    no,
+    topProb,
+    side,
+    floorStrike,
+    volume: Number(raw?.volume_24h_fp ?? raw?.volume_fp ?? 0),
+    liquidity: Number(raw?.liquidity_dollars ?? 0),
+    lastPrice: Number(raw?.last_price_dollars ?? 0),
+    spread: Math.abs(yes - no)
+  };
+}
+
+async function loadKalshiSeriesMarkets(seriesTicker) {
+  const data = await getJson(`https://external-api.kalshi.com/trade-api/v2/markets?series_ticker=${seriesTicker}&status=open&limit=100`);
+  return (data?.markets || []).map(normalizeKalshiMarket);
+}
+
+async function buildHighOutcomeSummary() {
+  const series = ['KXETH15M', 'KXBTC15M', 'KXETH30M', 'KXBTC30M', 'KXETH1H', 'KXBTC1H', 'KXXRP15M', 'KXSOL15M'];
+  const ranked = [];
+  for (const seriesTicker of series) {
+    try {
+      const markets = await loadKalshiSeriesMarkets(seriesTicker);
+      ranked.push(...markets.filter(m => m.ticker && (m.yes > 0.05 || m.no > 0.05)));
+    } catch (error) {
+      // Fail closed: continue without blocking the market report.
+    }
+  }
+
+  const sorted = ranked.sort((a, b) => (b.topProb - a.topProb) || (b.volume - a.volume));
+  const top = sorted[0] || null;
+  const bestScalperEntry = top ? (() => {
+    const side = top.side;
+    const entryTarget = side === 'YES' ? Math.min(0.48, Math.max(0.38, top.yes - 0.05)) : Math.min(0.48, Math.max(0.38, top.no - 0.05));
+    return `${side} only if it dips to about ${entryTarget.toFixed(2)} and holds; avoid chasing near ${Math.max(top.yes, top.no).toFixed(2)} when the spread is dead flat.`;
+  })() : 'No live accessible market found right now. Wait for a fresh directional move away from mid.';
+
+  const bestExit = top ? (() => {
+    const side = top.side;
+    const target = side === 'YES' ? top.yes + 0.03 : top.no + 0.03;
+    const hardStop = side === 'YES' ? top.yes - 0.02 : top.no - 0.02;
+    return `${side} first target: ${Math.min(target, 0.95).toFixed(2)}; hard stop: ${Math.max(hardStop, 0.05).toFixed(2)}. Exit after the first 60-180s directional push or when momentum stalls.`;
+  })() : 'No exit edge available without a fresh market move.';
+
+  const multiplierTiming = top ? (() => {
+    const side = top.side;
+    const buyPrice = side === 'YES' ? Math.min(top.yes, 0.6) : Math.min(top.no, 0.6);
+    return `Best multiplier / higher-yield buy window is when ${side} is temporarily discounted below 0.60, especially in the first 0-5 minutes after a breakout or after a sharp flush that restores trend. Do not chase it near 0.50-0.52 unless momentum is confirmed.`;
+  })() : 'No high-yield buy setup available right now. Wait for a fresh breakout/dislocation.';
+
+  const topList = sorted.slice(0, 5).map((m, index) => {
+    const side = m.side;
+    const prob = Math.max(m.yes, m.no);
+    return `${index + 1}. ${m.ticker} | ${side} ${Math.max(m.yes, m.no).toFixed(2)} | NO ${m.no.toFixed(2)} | YES ${m.yes.toFixed(2)} | ${m.title || 'market'} ${m.closeTime ? `| closes ${m.closeTime.slice(11, 16)}Z` : ''}`.trim();
+  });
+
+  return {
+    top,
+    ranked: sorted,
+    summary: {
+      bestScalperEntry,
+      bestExit,
+      multiplierTiming,
+      topList
+    }
+  };
+}
+
 async function collect() {
   const jobs = [
     ['Coinbase 1m', () => coinbase(60), 1],
@@ -167,12 +247,14 @@ async function collect() {
     failures.push(`Deribit: ${error.message}`);
   }
 
+  const kalshiSummary = await buildHighOutcomeSummary().catch(() => ({ summary: { bestScalperEntry: 'Kalshi market summary unavailable right now.', bestExit: 'No exit edge available right now.', multiplierTiming: 'No high-yield timing available right now.', topList: [] } }));
+
   const weightedScore = analyses.reduce((sum, item) => sum + item.result.score * item.weight, 0);
   const weightTotal = analyses.reduce((sum, item) => sum + item.weight, 0);
   const score = weightTotal ? weightedScore / weightTotal : 0;
   const prediction = score >= 1.5 ? 'UP' : score <= -1.5 ? 'DOWN' : 'MIXED';
   const agreement = analyses.filter(item => item.result.bias === prediction).length;
-  return { generatedAt: new Date().toISOString(), prediction, score, agreement, spot, dayChange, derivatives, analyses, failures };
+  return { generatedAt: new Date().toISOString(), prediction, score, agreement, spot, dayChange, derivatives, analyses, failures, kalshiSummary };
 }
 
 function print(report) {
@@ -183,6 +265,16 @@ function print(report) {
   for (const item of report.analyses) {
     const value = item.result;
     console.log(`${item.name.padEnd(16)} ${value.bias.padEnd(5)} RSI ${value.rsi14.toFixed(1).padStart(5)} | EMA9/21 ${value.ema9.toFixed(1)}/${value.ema21.toFixed(1)} | 15m ${value.return15.toFixed(3)}%`);
+  }
+  if (report.kalshiSummary?.summary) {
+    console.log('\nSCALPER / MULTIPLIER MARKET SUMMARY');
+    console.log(`BEST ENTRY: ${report.kalshiSummary.summary.bestScalperEntry}`);
+    console.log(`BEST EXIT: ${report.kalshiSummary.summary.bestExit}`);
+    console.log(`BEST MULTIPLIER / YIELD TIMING: ${report.kalshiSummary.summary.multiplierTiming}`);
+    if (report.kalshiSummary.summary.topList.length) {
+      console.log('TOP HIGH-PROBABILITY MARKETS');
+      for (const line of report.kalshiSummary.summary.topList) console.log(`  ${line}`);
+    }
   }
   if (report.failures.length) console.log(`Unavailable: ${report.failures.join(' | ')}`);
   console.log('Paper analysis only. No orders, Telegram messages, or authenticated APIs are used.');

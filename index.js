@@ -30,6 +30,21 @@ const KALSHI_API_KEY = process.env.KALSHI_API_KEY;
 const YOUR_TELEGRAM_ID = process.env.YOUR_TELEGRAM_ID;
 const PUBLIC_TELEGRAM_ID = process.env.PUBLIC_TELEGRAM_ID; // optional: public group/channel ID
 const KALSHI_BASE_URL = 'https://external-api.kalshi.com/trade-api/v2';
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER;
+const SMS_TO_NUMBER = process.env.SMS_TO_NUMBER || '+14147088863';
+const SMS_ENABLED = false;
+const EMAIL_TO = process.env.EMAIL_TO || 'rich.swper@icloud.com';
+const EMAIL_FROM = process.env.EMAIL_FROM || 'noreply@localhost';
+const NOTE_APP_PATH = process.env.NOTE_APP_PATH || path.join(__dirname, 'tablet_notes.txt');
+const NOTE_APP_ENABLED = false;
+const SMTP_HOST = process.env.SMTP_HOST;
+const SMTP_PORT = Number(process.env.SMTP_PORT || '587');
+const SMTP_USER = process.env.SMTP_USER;
+const SMTP_PASS = process.env.SMTP_PASS;
+const SMTP_SECURE = process.env.SMTP_SECURE === 'true';
+const EMAIL_ENABLED = false;
 const ALPHA_VANTAGE_KEY = null; // removed — all commodities now use Yahoo Finance
 
 const KALSHI_KEY_PATH = process.env.KALSHI_KEY_PATH || './kalshi_key.pem';
@@ -51,6 +66,143 @@ const NO_CREDENTIALS_MODE = !HAS_TELEGRAM_CREDENTIALS || !HAS_KALSHI_CREDENTIALS
 
 if (NO_CREDENTIALS_MODE) {
   console.warn('ℹ️ Running in no-credentials mode: public data and local state only; trading and Telegram are disabled.');
+}
+
+async function sendTextMessage(text) {
+  const body = String(text || '').trim();
+  if (!SMS_ENABLED || !body) return { ok: false, reason: 'sms disabled or empty' };
+
+  if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && TWILIO_FROM_NUMBER) {
+    try {
+      const twilio = require('twilio');
+      const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+      await client.messages.create({
+        body: body.slice(0, 1500),
+        from: TWILIO_FROM_NUMBER,
+        to: SMS_TO_NUMBER
+      });
+      return { ok: true, mode: 'twilio' };
+    } catch (err) {
+      console.error('SMS send failed:', err.message);
+      return { ok: false, reason: err.message };
+    }
+  }
+
+  console.log(`[SMS LOG ONLY] ${SMS_TO_NUMBER}: ${body.slice(0, 250)}`);
+  return { ok: true, mode: 'log-only' };
+}
+
+async function writeToNoteApp(text) {
+  const body = String(text || '').trim();
+  if (!NOTE_APP_ENABLED || !body) return { ok: false, reason: 'note app disabled or empty' };
+
+  try {
+    const noteDir = path.dirname(NOTE_APP_PATH);
+    fs.mkdirSync(noteDir, { recursive: true });
+
+    const entry = [
+      `--- ${new Date().toLocaleString()} ---`,
+      body,
+      ''
+    ].join('\n');
+
+    fs.appendFileSync(NOTE_APP_PATH, entry, 'utf8');
+    return { ok: true, mode: 'note-file', path: NOTE_APP_PATH };
+  } catch (err) {
+    console.error('Note app write failed:', err.message);
+    return { ok: false, reason: err.message };
+  }
+}
+
+async function sendMarketSummaryEmail() {
+  try {
+    const summary = await buildKalshiHighOutcomeSummary();
+    const body = [
+      `Kalshi update ${new Date().toLocaleString()}`,
+      '',
+      `BEST ENTRY: ${summary.summary.bestScalperEntry}`,
+      `BEST EXIT: ${summary.summary.bestExit}`,
+      `BEST MULTIPLIER / YIELD TIMING: ${summary.summary.multiplierTiming}`,
+      '',
+      'TOP HIGH-PROBABILITY MARKETS',
+      ...summary.summary.topList.slice(0, 3)
+    ].join('\n');
+    return await sendAlertEmail({ subject: 'Kalshi Market Update', body });
+  } catch (err) {
+    console.error('Market summary email failed:', err.message);
+    return { ok: false, reason: err.message };
+  }
+}
+
+async function sendMarketSummaryNote() {
+  try {
+    const summary = await buildKalshiHighOutcomeSummary();
+    const msg = [
+      `Kalshi update ${new Date().toLocaleTimeString()}`,
+      `BEST ENTRY: ${summary.summary.bestScalperEntry}`,
+      `BEST EXIT: ${summary.summary.bestExit}`,
+      `BEST MULTIPLIER / YIELD TIMING: ${summary.summary.multiplierTiming}`,
+      `TOP: ${summary.summary.topList.slice(0, 3).join(' | ')}`
+    ].join('\n');
+    return await writeToNoteApp(msg);
+  } catch (err) {
+    console.error('Market summary note write failed:', err.message);
+    return { ok: false, reason: err.message };
+  }
+}
+
+async function sendAlertEmail({ subject = 'Kalshi Market Update', body }) {
+  if (!EMAIL_ENABLED || !body) return { ok: false, reason: 'email disabled or empty body' };
+  if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
+    const nodemailer = require('nodemailer');
+    const transporter = nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: SMTP_PORT,
+      secure: SMTP_SECURE,
+      auth: { user: SMTP_USER, pass: SMTP_PASS }
+    });
+    await transporter.sendMail({
+      from: EMAIL_FROM,
+      to: EMAIL_TO,
+      subject,
+      text: body
+    });
+    return { ok: true, mode: 'smtp' };
+  }
+
+  console.log(`[EMAIL LOG ONLY] ${EMAIL_TO}:\n${body.slice(0, 400)}`);
+  return { ok: true, mode: 'log-only' };
+}
+
+async function sendMarketSummaryText() {
+  try {
+    const summary = await buildKalshiHighOutcomeSummary();
+    const msg = [
+      `Kalshi update ${new Date().toLocaleTimeString()}`,
+      `BEST ENTRY: ${summary.summary.bestScalperEntry}`,
+      `BEST EXIT: ${summary.summary.bestExit}`,
+      `BEST MULTIPLIER / YIELD TIMING: ${summary.summary.multiplierTiming}`,
+      `TOP: ${summary.summary.topList.slice(0, 3).join(' | ')}`
+    ].join('\n');
+    return await writeToNoteApp(msg);
+  } catch (err) {
+    console.error('Market summary note write failed:', err.message);
+    return { ok: false, reason: err.message };
+  }
+}
+
+if (NOTE_APP_ENABLED) {
+  console.log(`📝 Tablet note app enabled at ${NOTE_APP_PATH}. Writing every 5 minutes.`);
+  setInterval(() => { sendMarketSummaryNote().catch(() => {}); }, 5 * 60 * 1000);
+} else if (SMS_ENABLED && TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && TWILIO_FROM_NUMBER) {
+  console.log(`📱 SMS alerts enabled for ${SMS_TO_NUMBER}. Sending every 5 minutes.`);
+  setInterval(() => { sendMarketSummaryText().catch(() => {}); }, 5 * 60 * 1000);
+} else if (EMAIL_ENABLED) {
+  console.log(`📧 Email alerts enabled for ${EMAIL_TO}. Sending every 5 minutes.`);
+  setInterval(() => { sendMarketSummaryEmail().catch(() => {}); }, 5 * 60 * 1000);
+} else if (SMS_ENABLED) {
+  console.log(`📱 SMS mode enabled in log-only mode for ${SMS_TO_NUMBER}. Add TWILIO_* env vars to send real texts.`);
+  setInterval(() => { sendMarketSummaryText().catch(() => {}); }, 5 * 60 * 1000);
 }
 
 // ============================================
@@ -791,6 +943,43 @@ bot.onText(/\/check_now/, async (msg) => {
   bot.sendMessage(msg.chat.id, '✅ Scan complete.');
 });
 
+bot.onText(/\/email_test/i, async (msg) => {
+  try {
+    const summary = await buildKalshiHighOutcomeSummary();
+    const body = [
+      `EMAIL TEST ${new Date().toLocaleString()}`,
+      '',
+      `BEST ENTRY: ${summary.summary.bestScalperEntry}`,
+      `BEST EXIT: ${summary.summary.bestExit}`,
+      `BEST MULTIPLIER / YIELD TIMING: ${summary.summary.multiplierTiming}`,
+      '',
+      'TOP HIGH-PROBABILITY MARKETS',
+      ...summary.summary.topList.slice(0, 3)
+    ].join('\n');
+    const result = await writeToNoteApp(body);
+    bot.sendMessage(msg.chat.id, result.ok ? `✅ Note app test saved to ${NOTE_APP_PATH}.` : `⚠️ Note app test failed: ${result.reason || 'unknown error'}`);
+  } catch (err) {
+    bot.sendMessage(msg.chat.id, `⚠️ Note app test error: ${err.message}`);
+  }
+});
+
+bot.onText(/\/sms_test/i, async (msg) => {
+  try {
+    const summary = await buildKalshiHighOutcomeSummary();
+    const text = [
+      `SMS TEST ${new Date().toLocaleTimeString()}`,
+      `BEST ENTRY: ${summary.summary.bestScalperEntry}`,
+      `BEST EXIT: ${summary.summary.bestExit}`,
+      `BEST MULTIPLIER / YIELD TIMING: ${summary.summary.multiplierTiming}`,
+      `TOP: ${summary.summary.topList.slice(0, 3).join(' | ')}`
+    ].join('\n');
+    const result = await writeToNoteApp(text);
+    bot.sendMessage(msg.chat.id, result.ok ? `✅ Note app test saved to ${NOTE_APP_PATH}.` : `⚠️ Note app test failed: ${result.reason || 'unknown error'}`);
+  } catch (err) {
+    bot.sendMessage(msg.chat.id, `⚠️ Note app test error: ${err.message}`);
+  }
+});
+
 // Opportunity radar — full quant read on every live crypto market/timeframe.
 bot.onText(/\/radar/, async (msg) => {
   bot.sendMessage(msg.chat.id, '📡 Scanning live markets (15m cycle first)...');
@@ -801,10 +990,12 @@ bot.onText(/\/radar/, async (msg) => {
     analyses.push(a);
     await sleep(350);
   }
+  const kSummary = await buildKalshiHighOutcomeSummary().catch(() => ({ summary: { bestScalperEntry: 'No live Kalshi summary available.', bestExit: 'No exit edge available.', multiplierTiming: 'No yield timing available.', topList: [] } }));
+  const radarSummary = formatKalshiHighOutcomeSummary(kSummary);
   await bot.sendMessage(msg.chat.id,
     `📡 RADAR · ${quantCyclePhase().label} · edge bar ${(activeEdgeBar() * 100).toFixed(0)}pp · budget ${windowLeft()}/${WINDOW_PROPOSAL_MAX}\n` +
     `🟢▲ up · 🔴▼ down · 🎯 tradeable now\n\n` +
-    renderRadar(analyses));
+    renderRadar(analyses) + '\n\n' + radarSummary);
   // Tap-to-fire buttons for the best tradeable plays (respects the window budget).
   const buys = analyses
     .filter(a => quantTradeable(a))
@@ -909,6 +1100,13 @@ bot.onText(/\/cycle/, async (msg) => {
   if (prev.length) {
     lines.push('Prior cycles:');
     for (const c of prev) lines.push(`· ${c.id} p${c.proposed || 0}/t${c.taken || 0} ${c.phaseAtWrite || ''}`);
+  }
+  try {
+    const kSummary = await buildKalshiHighOutcomeSummary();
+    const summaryText = formatKalshiHighOutcomeSummary(kSummary);
+    lines.push('', summaryText);
+  } catch (_) {
+    lines.push('', 'SCALPER / MULTIPLIER MARKET SUMMARY', 'No live Kalshi summary available.');
   }
   lines.push('', 'Commands: /analysis · /plays · /memory');
   await bot.sendMessage(msg.chat.id, lines.join('\n').slice(0, 3500));
@@ -4676,6 +4874,85 @@ function quantSummary(a) {
     `Model ${pct(a.modelProb)} vs market ${cents(mktProb)} · edge ${pp(a.edge)}\n` +
     `σ ${(a.ind.sigmaPerMin * 100).toFixed(3)}%/min · RSI ${a.ind.rsi.toFixed(0)} · mom ${pct(a.ind.momentum, 2)} · ${formatMinsLeft(a.minsToClose)} left` +
     (a.news ? ` · F&G ${a.news.label}` : '');
+}
+
+async function buildKalshiHighOutcomeSummary() {
+  const seriesTickers = ['KXETH15M', 'KXBTC15M', 'KXETH30M', 'KXBTC30M', 'KXETH1H', 'KXBTC1H', 'KXXRP15M', 'KXSOL15M'];
+  const rows = [];
+  for (const seriesTicker of seriesTickers) {
+    try {
+      const resp = await axios.get(`${KALSHI_BASE_URL}/markets?series_ticker=${encodeURIComponent(seriesTicker)}&status=open&limit=100`, { timeout: 12000 });
+      const markets = resp.data?.markets || [];
+      for (const market of markets) {
+        const yes = Number(market.yes_ask_dollars ?? market.yes_bid_dollars ?? 0);
+        const no = Number(market.no_ask_dollars ?? market.no_bid_dollars ?? 0);
+        const topProb = Math.max(yes, no);
+        if (!market.ticker || (yes <= 0.05 && no <= 0.05)) continue;
+        rows.push({
+          ticker: market.ticker,
+          title: market.title || market.name || '',
+          yes,
+          no,
+          topProb,
+          side: yes >= no ? 'YES' : 'NO',
+          closeTime: market.close_time || '',
+          volume: Number(market.volume_24h_fp || market.volume_fp || 0),
+          floorStrike: Number(market.floor_strike || 0)
+        });
+      }
+    } catch (_) {
+      // Fail closed: keep the bot running and continue without blocking the report.
+    }
+  }
+
+  const sorted = rows.sort((a, b) => (b.topProb - a.topProb) || (b.volume - a.volume));
+  const top = sorted[0] || null;
+  const bestScalperEntry = top ? (() => {
+    const side = top.side;
+    const entryTarget = side === 'YES' ? Math.min(0.48, Math.max(0.38, top.yes - 0.05)) : Math.min(0.48, Math.max(0.38, top.no - 0.05));
+    return `${side} only if it dips to about ${entryTarget.toFixed(2)} and holds; avoid chasing near ${Math.max(top.yes, top.no).toFixed(2)} when the spread is dead flat.`;
+  })() : 'No live accessible market found right now. Wait for a fresh directional move away from mid.';
+
+  const bestExit = top ? (() => {
+    const side = top.side;
+    const target = side === 'YES' ? top.yes + 0.03 : top.no + 0.03;
+    const hardStop = side === 'YES' ? top.yes - 0.02 : top.no - 0.02;
+    return `${side} first target: ${Math.min(target, 0.95).toFixed(2)}; hard stop: ${Math.max(hardStop, 0.05).toFixed(2)}. Exit after the first 60-180s directional push or when momentum stalls.`;
+  })() : 'No exit edge available without a fresh market move.';
+
+  const multiplierTiming = top ? (() => {
+    const side = top.side;
+    return `Best multiplier / higher-yield buy window is when ${side} is temporarily discounted below 0.60, especially in the first 0-5 minutes after a breakout or after a sharp flush that restores trend. Do not chase it near 0.50-0.52 unless momentum is confirmed.`;
+  })() : 'No high-yield buy setup available right now. Wait for a fresh breakout/dislocation.';
+
+  const topList = sorted.slice(0, 5).map((m, idx) => {
+    return `${idx + 1}. ${m.ticker} | ${m.side} ${m.topProb.toFixed(2)} | YES ${m.yes.toFixed(2)} | NO ${m.no.toFixed(2)} | ${m.title || 'market'}${m.closeTime ? ` | closes ${m.closeTime.slice(11, 16)}Z` : ''}`;
+  });
+
+  return {
+    top,
+    summary: {
+      bestScalperEntry,
+      bestExit,
+      multiplierTiming,
+      topList
+    }
+  };
+}
+
+function formatKalshiHighOutcomeSummary(summary) {
+  if (!summary || !summary.summary) return 'SCALPER / MULTIPLIER MARKET SUMMARY\nNo live Kalshi summary available.';
+  const lines = [
+    'SCALPER / MULTIPLIER MARKET SUMMARY',
+    `BEST ENTRY: ${summary.summary.bestScalperEntry}`,
+    `BEST EXIT: ${summary.summary.bestExit}`,
+    `BEST MULTIPLIER / YIELD TIMING: ${summary.summary.multiplierTiming}`
+  ];
+  if (summary.summary.topList && summary.summary.topList.length) {
+    lines.push('TOP HIGH-PROBABILITY MARKETS');
+    for (const line of summary.summary.topList) lines.push(`  ${line}`);
+  }
+  return lines.join('\n');
 }
 
 function quantDecisionCard(a, winProb, betAmount, reviewNote, betId, playType, reasoning) {
