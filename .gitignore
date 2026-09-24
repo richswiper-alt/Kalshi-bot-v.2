@@ -24,3 +24,5 @@ Thumbs.db
 # Runtime data
 kalshi_state.json
 kalshi_memory.json
+kalshi_state.json
+bigs_wipe_knowledge.json
